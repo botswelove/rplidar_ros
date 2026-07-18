@@ -39,6 +39,7 @@
 #include "math.h"
 
 #include <signal.h>
+#include <chrono>
 
 #ifndef _countof
 #define _countof(_Array) (int)(sizeof(_Array) / sizeof(_Array[0]))
@@ -86,7 +87,8 @@ class RPlidarNode : public rclcpp::Node
         this->declare_parameter<std::string>("topic_name",std::string("scan"));
         this->declare_parameter<std::string>("scan_mode",std::string());
         this->declare_parameter<float>("scan_frequency",10);
-        
+        this->declare_parameter<float>("scan_watchdog_timeout", 10.0);
+
         this->get_parameter_or<std::string>("channel_type", channel_type, "serial");
         this->get_parameter_or<std::string>("tcp_ip", tcp_ip, "192.168.0.7"); 
         this->get_parameter_or<int>("tcp_port", tcp_port, 20108);
@@ -105,6 +107,7 @@ class RPlidarNode : public rclcpp::Node
             this->get_parameter_or<float>("scan_frequency", scan_frequency, 20.0);
         else
             this->get_parameter_or<float>("scan_frequency", scan_frequency, 10.0);
+        this->get_parameter_or<float>("scan_watchdog_timeout", scan_watchdog_timeout, 10.0);
     }
 
     bool getRPLIDARDeviceInfo(ILidarDriver * drv)
@@ -449,6 +452,13 @@ public:
         rclcpp::Time start_scan_time;
         rclcpp::Time end_scan_time;
         double scan_duration;
+        // The SDK never reports a dead link (its RX thread exits silently and
+        // isConnected() stays true), so after a USB drop grabScanDataHq() times
+        // out forever. Track wall time since the last good grab and exit
+        // non-zero so an external supervisor can restart the driver.
+        rclcpp::Clock throttle_clock(RCL_STEADY_TIME);
+        auto last_scan_ok = std::chrono::steady_clock::now();
+        bool watchdog_tripped = false;
         while (rclcpp::ok() && !need_exit) {
             sl_lidar_response_measurement_node_hq_t nodes[8192];
             size_t   count = _countof(nodes);
@@ -470,6 +480,7 @@ public:
             scan_duration = (end_scan_time - start_scan_time).seconds();
 
             if (op_result == SL_RESULT_OK) {
+                last_scan_ok = std::chrono::steady_clock::now();
                 if(scan_frequency_tunning_after_scan) { //Set scan frequency(For Slamtec Tof lidar)
                     RCLCPP_INFO(this->get_logger(), "set lidar scan frequency to %.1f Hz(%.1f Rpm) ",scan_frequency,scan_frequency*60);
                     drv->setMotorSpeed(scan_frequency*60); //rpm 
@@ -538,6 +549,24 @@ public:
                                 angle_min, angle_max, max_distance,
                                 frame_id);
                 }
+            } else if (!is_scanning) {
+                // Deliberately stopped (auto_standby idle or stop_motor service):
+                // grab timeouts are expected, keep the watchdog suspended.
+                last_scan_ok = std::chrono::steady_clock::now();
+            } else {
+                double stale = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - last_scan_ok).count();
+                RCLCPP_WARN_THROTTLE(this->get_logger(), throttle_clock, 5000,
+                    "Failed to grab scan data, result: %08x (no scan for %.1f s)",
+                    (unsigned int)op_result, stale);
+                if (scan_watchdog_timeout > 0.0f && stale > scan_watchdog_timeout) {
+                    RCLCPP_FATAL(this->get_logger(),
+                        "No scan data for %.1f s (threshold %.1f s, last result: %08x), "
+                        "lidar link presumed dead, exiting so the supervisor can restart the driver.",
+                        stale, scan_watchdog_timeout, (unsigned int)op_result);
+                    watchdog_tripped = true;
+                    break;
+                }
             }
 
             rclcpp::spin_some(shared_from_this());
@@ -548,7 +577,7 @@ public:
         drv->stop();
         RCLCPP_INFO(this->get_logger(),"Stop motor");
         if (drv) { delete drv;  drv = nullptr; }
-        return 0;
+        return watchdog_tripped ? 1 : 0;
     }
 
   private:
@@ -573,6 +602,7 @@ public:
     size_t angle_compensate_multiple = 1;//it stand of angle compensate at per 1 degree
     std::string scan_mode;
     float scan_frequency;
+    float scan_watchdog_timeout = 10.0;
     /* State */
     bool is_scanning = false;
 
